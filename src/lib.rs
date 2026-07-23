@@ -18,6 +18,13 @@ pub mod github;
 pub mod hooks;
 pub mod logging;
 pub mod migrations;
+/// Pure-Rust client for the long-lived `opencode serve` HTTP
+/// transport. The types, client, SSE consumer, and Todo mapping
+/// live here; the bridge into `AcpState::Event` is a follow-up in
+/// `src/acp/opencode_bridge.rs`. Ungate stays — there's no JS or
+/// heavy dep, and keeping the module reachable from any build
+/// makes incremental rollout cheaper.
+pub mod opencode;
 pub mod plugin;
 pub mod process;
 #[cfg(feature = "serve")]

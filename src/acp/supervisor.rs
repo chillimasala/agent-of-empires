@@ -33,7 +33,10 @@ use super::acp_client::{AcpClient, AcpError, DeleteSessionOutcome, SpawnConfig};
 use super::agent_registry::{AgentRegistry, AgentSpec};
 use super::approvals::{ApprovalDecision, Nonce};
 use super::elicitations::{ElicitationOutcome, ElicitationResolution};
+use super::opencode_bridge::OpenCodeEventMapper;
 use super::state::{AcpSessionId, Event};
+use crate::opencode::types::GlobalEvent as OpenCodeGlobalEvent;
+use crate::opencode::{Client as OpenCodeClient, ClientError as OpenCodeClientError};
 use crate::session::SandboxInfo;
 
 /// Maximum number of post-startup respawns within `RESTART_WINDOW`.
@@ -140,8 +143,12 @@ async fn try_session_delete(client: &AcpClient, session_id: &str) {
 pub enum SupervisorError {
     #[error("session {0:?} not found")]
     UnknownSession(String),
+    #[error("approval is no longer pending")]
+    UnknownPermission,
     #[error("acp client error: {0}")]
     Acp(#[from] AcpError),
+    #[error("opencode client error: {0}")]
+    OpenCode(#[from] OpenCodeClientError),
     #[error("agent {0:?} not in registry")]
     UnknownAgent(String),
     #[error("{0}")]
@@ -161,6 +168,10 @@ pub enum SupervisorError {
     /// the requested end state (no worker for this session) holds.
     #[error("resume of session {0:?} was cancelled by a concurrent shutdown")]
     SpawnCancelled(String),
+    #[error("{0} is not supported by the opencode server transport")]
+    UnsupportedOpenCodeOperation(&'static str),
+    #[error("failed to start opencode server: {0}")]
+    OpenCodeLaunch(String),
 }
 
 /// Frame published to the broadcast channel; mirrors
@@ -269,6 +280,19 @@ struct WorkerHandle {
     kind: WorkerKind,
 }
 
+struct OpenCodeWorkerHandle {
+    client: OpenCodeClient,
+    opencode_session_id: String,
+    mapper: Arc<Mutex<OpenCodeEventMapper>>,
+    model: Option<(String, String)>,
+    drain_task: JoinHandle<()>,
+}
+
+struct OpenCodeEventHub {
+    sender: broadcast::Sender<OpenCodeGlobalEvent>,
+    task: JoinHandle<()>,
+}
+
 /// Per-session monotonically-increasing seq counter. Lives at the
 /// supervisor level (not on `WorkerHandle`) so it survives shutdown
 /// and respawn cycles, and also covers the no-worker
@@ -323,6 +347,9 @@ pub struct Supervisor<S: BroadcastSink> {
     sink: Arc<S>,
     registry: Arc<Mutex<AgentRegistry>>,
     workers: Arc<Mutex<HashMap<String, WorkerHandle>>>,
+    opencode_workers: Arc<Mutex<HashMap<String, OpenCodeWorkerHandle>>>,
+    opencode_event_hubs: Arc<Mutex<HashMap<String, OpenCodeEventHub>>>,
+    opencode_processes: Arc<Mutex<HashMap<String, tokio::process::Child>>>,
     next_seqs: Arc<SeqMap>,
     /// Reservation map: a session_id present here means another task is
     /// mid-resume (spawn OR attach) for it. The `ResumeKind` lets the
@@ -616,6 +643,9 @@ impl<S: BroadcastSink> Supervisor<S> {
             sink,
             registry: Arc::new(Mutex::new(AgentRegistry::with_defaults())),
             workers: Arc::new(Mutex::new(HashMap::new())),
+            opencode_workers: Arc::new(Mutex::new(HashMap::new())),
+            opencode_event_hubs: Arc::new(Mutex::new(HashMap::new())),
+            opencode_processes: Arc::new(Mutex::new(HashMap::new())),
             next_seqs: Arc::new(std::sync::Mutex::new(HashMap::new())),
             pending_resumes: Arc::new(std::sync::Mutex::new(HashMap::new())),
             cancelled_resumes: Arc::new(std::sync::Mutex::new(HashSet::new())),
@@ -713,6 +743,9 @@ impl<S: BroadcastSink> Supervisor<S> {
         for id in self.workers.lock().await.keys() {
             out.insert(id.clone(), AcpWorkerState::Running);
         }
+        for id in self.opencode_workers.lock().await.keys() {
+            out.insert(id.clone(), AcpWorkerState::Running);
+        }
         for id in lock_recover(&self.pending_resumes).keys() {
             // Running wins over Resuming if both maps happen to carry
             // the id during a hand-off; the WorkerHandle is the
@@ -728,6 +761,9 @@ impl<S: BroadcastSink> Supervisor<S> {
     /// occasional one-off query.
     pub async fn worker_state(&self, session_id: &str) -> AcpWorkerState {
         if self.workers.lock().await.contains_key(session_id) {
+            return AcpWorkerState::Running;
+        }
+        if self.opencode_workers.lock().await.contains_key(session_id) {
             return AcpWorkerState::Running;
         }
         if lock_recover(&self.pending_resumes).contains_key(session_id) {
@@ -801,9 +837,13 @@ impl<S: BroadcastSink> Supervisor<S> {
                 return name.to_string();
             }
         }
-        // Step 2: tool-keyed registry lookup.
+        // OpenCode uses the shared HTTP transport by default. An explicit
+        // agent override above can still select the per-session ACP adapter.
         {
             let reg = self.registry.lock().await;
+            if tool == "opencode" && reg.get("opencode-server").is_some() {
+                return "opencode-server".to_string();
+            }
             if reg.get(tool).is_some() {
                 return tool.to_string();
             }
@@ -1145,6 +1185,9 @@ impl<S: BroadcastSink> Supervisor<S> {
     /// for sessions whose record predates the `agent_key` field
     /// (empty after the serde default).
     async fn agent_key_for_session(&self, session_id: &str) -> String {
+        if self.opencode_workers.lock().await.contains_key(session_id) {
+            return "opencode-server".to_string();
+        }
         if let Some(handle) = self.workers.lock().await.get(session_id) {
             if let WorkerKind::Runner { spawn_config } = &handle.kind {
                 return spawn_config.agent_key.clone();
@@ -1230,9 +1273,12 @@ impl<S: BroadcastSink> Supervisor<S> {
         kind: ResumeKind,
     ) -> Result<ResumeReservationOutcome, SupervisorError> {
         let workers = self.workers.lock().await;
-        if workers.contains_key(session_id) {
+        if workers.contains_key(session_id)
+            || self.opencode_workers.lock().await.contains_key(session_id)
+        {
             return Ok(ResumeReservationOutcome::AlreadyPresent);
         }
+        let opencode_count = self.opencode_workers.lock().await.len();
         let mut pending = lock_recover(&self.pending_resumes);
         if pending.contains_key(session_id) {
             return Ok(ResumeReservationOutcome::AlreadyPresent);
@@ -1260,7 +1306,8 @@ impl<S: BroadcastSink> Supervisor<S> {
                     .values()
                     .filter(|k| matches!(k, ResumeKind::Spawn))
                     .count();
-                let combined = workers.len() + registry_count + pending_spawn_count;
+                let combined =
+                    workers.len() + opencode_count + registry_count + pending_spawn_count;
                 if combined >= self.max_concurrent_workers as usize {
                     return Err(SupervisorError::CapacityFull {
                         current: combined,
@@ -1372,6 +1419,27 @@ impl<S: BroadcastSink> Supervisor<S> {
                     .command
                     .replace("${aoe_data_dir}", &data_dir.to_string_lossy());
             }
+        }
+
+        if spec.is_opencode_server() {
+            if fork_from.is_some() {
+                return Err(SupervisorError::UnsupportedOpenCodeOperation(
+                    "session fork",
+                ));
+            }
+            if sandbox_info.is_some() {
+                return Err(SupervisorError::UnsupportedOpenCodeOperation(
+                    "sandboxed sessions",
+                ));
+            }
+            let result = self
+                .spawn_opencode_session(session_id, cwd, model, stored_acp_session_id, spec)
+                .await;
+            if result.is_ok() && warmup_guard.is_some() {
+                lock_recover(&self.warmed_up_agents).insert(agent);
+            }
+            drop(warmup_guard);
+            return result;
         }
 
         let mut env = provider_env;
@@ -1570,6 +1638,247 @@ impl<S: BroadcastSink> Supervisor<S> {
             }
         }
         Ok(())
+    }
+
+    async fn spawn_opencode_session(
+        &self,
+        session_id: String,
+        cwd: PathBuf,
+        model: Option<String>,
+        stored_session_id: Option<String>,
+        spec: AgentSpec,
+    ) -> Result<(), SupervisorError> {
+        let base_url = spec.opencode_url.as_deref().ok_or_else(|| {
+            SupervisorError::InvalidAgentCommand(
+                "opencode-server requires an opencode_url".to_string(),
+            )
+        })?;
+        let mut client = OpenCodeClient::new(base_url)?.with_directory(cwd.to_string_lossy());
+        if let Some(auth) = spec.opencode_auth {
+            client = client.with_basic_auth(auth.username, auth.password);
+        }
+        self.ensure_opencode_server(&client).await?;
+
+        let title = format!("AoE {session_id}");
+        let remote_session = if let Some(stored_id) = stored_session_id {
+            match client.get_session(&stored_id).await {
+                Ok(session) => Some(session),
+                Err(OpenCodeClientError::Status { status, .. })
+                    if status == reqwest::StatusCode::NOT_FOUND =>
+                {
+                    None
+                }
+                Err(error) => return Err(error.into()),
+            }
+        } else {
+            None
+        };
+        let remote_session = match remote_session {
+            Some(session) => session,
+            None => match client
+                .list_sessions()
+                .await?
+                .into_iter()
+                .find(|session| session.title.as_deref() == Some(title.as_str()))
+            {
+                Some(session) => session,
+                None => client.create_session(Some(&title)).await?,
+            },
+        };
+        let mut events = self.subscribe_opencode_events(&client).await;
+
+        let mapper = Arc::new(Mutex::new(OpenCodeEventMapper::new(
+            remote_session.id.clone(),
+        )));
+        let sink = Arc::clone(&self.sink);
+        let next_seqs = Arc::clone(&self.next_seqs);
+        let aoe_session_id = session_id.clone();
+        let mapper_for_drain = Arc::clone(&mapper);
+        let drain_task = crate::task_util::spawn_supervised(
+            "supervisor.opencode_drain",
+            crate::task_util::PanicPolicy::Log,
+            async move {
+                loop {
+                    match events.recv().await {
+                        Ok(event) => {
+                            let mapped = mapper_for_drain.lock().await.map(event);
+                            for event in mapped {
+                                let seq = next_seq(&next_seqs, &aoe_session_id);
+                                sink.publish(&aoe_session_id, seq, &event);
+                            }
+                        }
+                        Err(broadcast::error::RecvError::Lagged(skipped)) => warn!(
+                            target: "acp.supervisor",
+                            session = %aoe_session_id,
+                            skipped,
+                            "opencode event consumer lagged"
+                        ),
+                        Err(broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+            },
+        );
+
+        let mut workers = self.opencode_workers.lock().await;
+        if workers.contains_key(&session_id) {
+            drain_task.abort();
+            return Err(SupervisorError::AlreadyRunning(session_id));
+        }
+        if lock_recover(&self.cancelled_resumes).remove(&session_id) {
+            drain_task.abort();
+            return Err(SupervisorError::SpawnCancelled(session_id));
+        }
+        let model = model.and_then(|value| {
+            value
+                .split_once('/')
+                .map(|(provider, model)| (provider.to_string(), model.to_string()))
+        });
+        workers.insert(
+            session_id.clone(),
+            OpenCodeWorkerHandle {
+                client,
+                opencode_session_id: remote_session.id,
+                mapper,
+                model,
+                drain_task,
+            },
+        );
+        drop(workers);
+        self.worker_notify.notify_waiters();
+        info!(
+            target: "acp.supervisor",
+            session = %session_id,
+            "opencode server session attached"
+        );
+        Ok(())
+    }
+
+    async fn ensure_opencode_server(&self, client: &OpenCodeClient) -> Result<(), SupervisorError> {
+        match client.health().await {
+            Ok(status) if status.healthy => return Ok(()),
+            Ok(_) => {}
+            Err(error) if !opencode_url_is_local(client) => return Err(error.into()),
+            Err(_) => {}
+        }
+
+        if !opencode_url_is_local(client) {
+            return Err(SupervisorError::OpenCodeLaunch(
+                "remote server reported unhealthy".to_string(),
+            ));
+        }
+        let host = client
+            .base_url()
+            .host_str()
+            .expect("local URL has a host")
+            .to_string();
+        let port = client.base_url().port_or_known_default().ok_or_else(|| {
+            SupervisorError::OpenCodeLaunch("local server URL has no port".to_string())
+        })?;
+        let key = opencode_server_key(client);
+
+        let mut processes = self.opencode_processes.lock().await;
+        let running = if let Some(child) = processes.get_mut(&key) {
+            matches!(child.try_wait(), Ok(None))
+        } else {
+            false
+        };
+        if !running {
+            processes.remove(&key);
+            let mut command = tokio::process::Command::new("opencode");
+            command
+                .arg("serve")
+                .arg("--hostname")
+                .arg(&host)
+                .arg("--port")
+                .arg(port.to_string())
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .kill_on_drop(true);
+            if let Some((username, password)) = client.auth_header() {
+                command.env("OPENCODE_SERVER_USERNAME", username);
+                command.env("OPENCODE_SERVER_PASSWORD", password);
+            }
+            let child = command
+                .spawn()
+                .map_err(|error| SupervisorError::OpenCodeLaunch(error.to_string()))?;
+            processes.insert(key.clone(), child);
+            info!(
+                target: "acp.supervisor",
+                %host,
+                port,
+                "started shared opencode server"
+            );
+        }
+        drop(processes);
+
+        for _ in 0..50 {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            if client.health().await.is_ok_and(|status| status.healthy) {
+                return Ok(());
+            }
+            let exited = {
+                let mut processes = self.opencode_processes.lock().await;
+                processes
+                    .get_mut(&key)
+                    .and_then(|child| child.try_wait().ok().flatten())
+            };
+            if let Some(status) = exited {
+                self.opencode_processes.lock().await.remove(&key);
+                return Err(SupervisorError::OpenCodeLaunch(format!(
+                    "process exited with {status}"
+                )));
+            }
+        }
+
+        let child = self.opencode_processes.lock().await.remove(&key);
+        if let Some(mut child) = child {
+            let _ = child.kill().await;
+        }
+        Err(SupervisorError::OpenCodeLaunch(
+            "health check timed out".to_string(),
+        ))
+    }
+
+    async fn subscribe_opencode_events(
+        &self,
+        client: &OpenCodeClient,
+    ) -> broadcast::Receiver<OpenCodeGlobalEvent> {
+        let key = opencode_server_key(client);
+        let mut hubs = self.opencode_event_hubs.lock().await;
+        if let Some(hub) = hubs.get(&key) {
+            return hub.sender.subscribe();
+        }
+
+        let (sender, receiver) = broadcast::channel(1024);
+        let sender_for_task = sender.clone();
+        let event_client = client.clone();
+        let task = crate::task_util::spawn_supervised(
+            "supervisor.opencode_events",
+            crate::task_util::PanicPolicy::Log,
+            async move {
+                loop {
+                    let mut stream = event_client.event_stream();
+                    while let Some(result) = stream.next().await {
+                        match result {
+                            Ok(event) => {
+                                let _ = sender_for_task.send(event);
+                            }
+                            Err(error) => {
+                                warn!(
+                                    target: "acp.supervisor",
+                                    "opencode event stream failed: {error}"
+                                );
+                                break;
+                            }
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+            },
+        );
+        hubs.insert(key, OpenCodeEventHub { sender, task });
+        receiver
     }
 
     /// Drain events from a worker into the broadcast sink. When the
@@ -2070,7 +2379,9 @@ impl<S: BroadcastSink> Supervisor<S> {
             let notified = self.worker_notify.notified();
             tokio::pin!(notified);
 
-            if self.workers.lock().await.contains_key(session_id) {
+            if self.workers.lock().await.contains_key(session_id)
+                || self.opencode_workers.lock().await.contains_key(session_id)
+            {
                 return true;
             }
             // No worker yet. If a resume (spawn or attach) is in
@@ -2118,6 +2429,35 @@ impl<S: BroadcastSink> Supervisor<S> {
     ) -> Result<(), SupervisorError> {
         self.wait_for_worker(session_id, std::time::Duration::from_secs(10))
             .await;
+        if let Some((client, remote_id, model)) = {
+            self.opencode_workers
+                .lock()
+                .await
+                .get(session_id)
+                .map(|handle| {
+                    (
+                        handle.client.clone(),
+                        handle.opencode_session_id.clone(),
+                        handle.model.clone(),
+                    )
+                })
+        } {
+            if !attachments.is_empty() {
+                return Err(SupervisorError::UnsupportedOpenCodeOperation(
+                    "prompt attachments",
+                ));
+            }
+            client
+                .prompt_async(
+                    &remote_id,
+                    text,
+                    model
+                        .as_ref()
+                        .map(|(provider, model)| (provider.as_str(), model.as_str())),
+                )
+                .await?;
+            return Ok(());
+        }
         let client = self.client_for_session(session_id).await?;
         client.send_prompt(text, attachments).await?;
         Ok(())
@@ -2128,6 +2468,16 @@ impl<S: BroadcastSink> Supervisor<S> {
     pub async fn cancel_prompt(&self, session_id: &str) -> Result<(), SupervisorError> {
         self.wait_for_worker(session_id, std::time::Duration::from_secs(10))
             .await;
+        if let Some((client, remote_id)) = {
+            self.opencode_workers
+                .lock()
+                .await
+                .get(session_id)
+                .map(|handle| (handle.client.clone(), handle.opencode_session_id.clone()))
+        } {
+            client.abort_session(&remote_id).await?;
+            return Ok(());
+        }
         let client = self.client_for_session(session_id).await?;
         client.cancel_prompt().await?;
         Ok(())
@@ -2148,7 +2498,15 @@ impl<S: BroadcastSink> Supervisor<S> {
     /// the drain (so it never triggers a restart on its own), and a second
     /// `Stopped` is a capped no-op for the reducer. See #1727 / #1100.
     pub async fn force_end_turn(&self, session_id: &str) {
-        if let Ok(client) = self.client_for_session(session_id).await {
+        if let Some((client, remote_id)) = {
+            self.opencode_workers
+                .lock()
+                .await
+                .get(session_id)
+                .map(|handle| (handle.client.clone(), handle.opencode_session_id.clone()))
+        } {
+            let _ = client.abort_session(&remote_id).await;
+        } else if let Ok(client) = self.client_for_session(session_id).await {
             let _ = client.force_cancel().await;
         }
         let seq = next_seq(&self.next_seqs, session_id);
@@ -2165,6 +2523,11 @@ impl<S: BroadcastSink> Supervisor<S> {
     pub async fn set_mode(&self, session_id: &str, mode_id: &str) -> Result<(), SupervisorError> {
         self.wait_for_worker(session_id, std::time::Duration::from_secs(10))
             .await;
+        if self.opencode_workers.lock().await.contains_key(session_id) {
+            return Err(SupervisorError::UnsupportedOpenCodeOperation(
+                "session modes",
+            ));
+        }
         let client = self.client_for_session(session_id).await?;
         client.set_mode(mode_id).await?;
         Ok(())
@@ -2180,6 +2543,11 @@ impl<S: BroadcastSink> Supervisor<S> {
     ) -> Result<(), SupervisorError> {
         self.wait_for_worker(session_id, std::time::Duration::from_secs(10))
             .await;
+        if self.opencode_workers.lock().await.contains_key(session_id) {
+            return Err(SupervisorError::UnsupportedOpenCodeOperation(
+                "session configuration options",
+            ));
+        }
         let client = self.client_for_session(session_id).await?;
         client.set_config_option(config_id, value).await?;
         Ok(())
@@ -2192,6 +2560,34 @@ impl<S: BroadcastSink> Supervisor<S> {
         nonce: Nonce,
         decision: ApprovalDecision,
     ) -> Result<(), SupervisorError> {
+        if let Some((client, remote_id, mapper)) = {
+            self.opencode_workers
+                .lock()
+                .await
+                .get(session_id)
+                .map(|handle| {
+                    (
+                        handle.client.clone(),
+                        handle.opencode_session_id.clone(),
+                        Arc::clone(&handle.mapper),
+                    )
+                })
+        } {
+            let permission_id = mapper
+                .lock()
+                .await
+                .take_permission_id(&nonce)
+                .ok_or(SupervisorError::UnknownPermission)?;
+            let response = match decision {
+                ApprovalDecision::Allow => "once",
+                ApprovalDecision::AllowAlways => "always",
+                ApprovalDecision::Deny | ApprovalDecision::Cancelled => "reject",
+            };
+            client
+                .reply_permission(&remote_id, &permission_id, response)
+                .await?;
+            return Ok(());
+        }
         let client = self.client_for_session(session_id).await?;
         client.resolve_permission(nonce, decision).await?;
         Ok(())
@@ -2205,6 +2601,11 @@ impl<S: BroadcastSink> Supervisor<S> {
         nonce: Nonce,
         resolution: ElicitationResolution,
     ) -> Result<(), SupervisorError> {
+        if self.opencode_workers.lock().await.contains_key(session_id) {
+            return Err(SupervisorError::UnsupportedOpenCodeOperation(
+                "elicitations",
+            ));
+        }
         let client = self.client_for_session(session_id).await?;
         client.resolve_elicitation(nonce, resolution).await?;
         Ok(())
@@ -2252,6 +2653,28 @@ impl<S: BroadcastSink> Supervisor<S> {
         stop_reason: &str,
         delete_adapter_state: bool,
     ) -> Result<(), SupervisorError> {
+        if let Some(handle) = self.opencode_workers.lock().await.remove(session_id) {
+            handle.drain_task.abort();
+            let _ = handle
+                .client
+                .abort_session(&handle.opencode_session_id)
+                .await;
+            if delete_adapter_state {
+                let _ = handle
+                    .client
+                    .delete_session(&handle.opencode_session_id)
+                    .await;
+            }
+            let seq = next_seq(&self.next_seqs, session_id);
+            self.sink.publish(
+                session_id,
+                seq,
+                &Event::Stopped {
+                    reason: stop_reason.into(),
+                },
+            );
+            return Ok(());
+        }
         // Hold workers + pending_resumes simultaneously so the spawn
         // can't observe an empty workers map, finish the handshake,
         // and insert a WorkerHandle while we're walking through this
@@ -2376,6 +2799,30 @@ impl<S: BroadcastSink> Supervisor<S> {
             let _ = handle.client.shutdown().await;
             handle.drain_task.abort();
         }
+        let opencode_drained: Vec<OpenCodeWorkerHandle> = {
+            let mut workers = self.opencode_workers.lock().await;
+            workers.drain().map(|(_, handle)| handle).collect()
+        };
+        for handle in opencode_drained {
+            let _ = handle
+                .client
+                .abort_session(&handle.opencode_session_id)
+                .await;
+            handle.drain_task.abort();
+        }
+        for (_, hub) in self.opencode_event_hubs.lock().await.drain() {
+            hub.task.abort();
+        }
+        let processes: Vec<tokio::process::Child> = self
+            .opencode_processes
+            .lock()
+            .await
+            .drain()
+            .map(|(_, child)| child)
+            .collect();
+        for mut child in processes {
+            let _ = child.kill().await;
+        }
 
         // Group-SIGTERM every runner we knew about, so detached agents that
         // outlived a previous daemon (and their node/SDK grandchildren) are
@@ -2415,6 +2862,26 @@ impl<S: BroadcastSink> Supervisor<S> {
             let _ = handle.client.shutdown().await;
             handle.drain_task.abort();
             super::worker_registry::mark_detached(&id);
+        }
+        let opencode_drained: Vec<OpenCodeWorkerHandle> = {
+            let mut workers = self.opencode_workers.lock().await;
+            workers.drain().map(|(_, handle)| handle).collect()
+        };
+        for handle in opencode_drained {
+            handle.drain_task.abort();
+        }
+        for (_, hub) in self.opencode_event_hubs.lock().await.drain() {
+            hub.task.abort();
+        }
+        let processes: Vec<tokio::process::Child> = self
+            .opencode_processes
+            .lock()
+            .await
+            .drain()
+            .map(|(_, child)| child)
+            .collect();
+        for mut child in processes {
+            let _ = child.kill().await;
         }
     }
 
@@ -2677,12 +3144,15 @@ impl<S: BroadcastSink> Supervisor<S> {
         if self.workers.lock().await.contains_key(session_id) {
             return true;
         }
+        if self.opencode_workers.lock().await.contains_key(session_id) {
+            return true;
+        }
         lock_recover(&self.pending_resumes).contains_key(session_id)
     }
 
     /// Return the number of running workers (for the doctor + stats).
     pub async fn count(&self) -> usize {
-        self.workers.lock().await.len()
+        self.workers.lock().await.len() + self.opencode_workers.lock().await.len()
     }
 
     /// Reap workers whose on-disk registry entry has disappeared while
@@ -2780,6 +3250,24 @@ fn terminate_runner_for_session(session_id: &str) {
     // Single-pid SIGTERM here used to orphan the agent's node/SDK children
     // under PID 1; see worker_registry::terminate and #1689.
     super::worker_registry::terminate(session_id);
+}
+
+fn opencode_server_key(client: &OpenCodeClient) -> String {
+    let auth = client.auth_header().unwrap_or(("", ""));
+    serde_json::to_string(&(client.base_url().as_str(), auth.0, auth.1))
+        .expect("string tuple serializes")
+}
+
+fn opencode_url_is_local(client: &OpenCodeClient) -> bool {
+    if client.base_url().scheme() != "http" {
+        return false;
+    }
+    client.base_url().host_str().is_some_and(|host| {
+        host.eq_ignore_ascii_case("localhost")
+            || host
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|address| address.is_loopback())
+    })
 }
 
 #[derive(Debug)]
@@ -3027,6 +3515,7 @@ impl BroadcastSink for ChannelSink {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::acp::agent_registry::AgentKind;
 
     fn spec(command: &str, args: &[&str]) -> AgentSpec {
         AgentSpec {
@@ -3034,6 +3523,9 @@ mod tests {
             args: args.iter().map(|s| s.to_string()).collect(),
             description: "test".into(),
             env_allowlist: None,
+            kind: AgentKind::AcpStdio,
+            opencode_url: None,
+            opencode_auth: None,
         }
     }
 
@@ -3153,6 +3645,52 @@ mod tests {
         }
         fn unresolved_elicitation_nonces(&self, _session_id: &str) -> Vec<Nonce> {
             self.stale_elicitation_nonces.lock().unwrap().clone()
+        }
+    }
+
+    #[test]
+    fn opencode_server_autostart_is_limited_to_loopback_http() {
+        assert!(opencode_url_is_local(
+            &OpenCodeClient::new("http://127.0.0.1:4096").unwrap()
+        ));
+        assert!(opencode_url_is_local(
+            &OpenCodeClient::new("http://localhost:4096").unwrap()
+        ));
+        assert!(!opencode_url_is_local(
+            &OpenCodeClient::new("https://127.0.0.1:4096").unwrap()
+        ));
+        assert!(!opencode_url_is_local(
+            &OpenCodeClient::new("http://example.com:4096").unwrap()
+        ));
+    }
+
+    #[tokio::test]
+    async fn opencode_tool_defaults_to_shared_server_transport() {
+        let sup = Supervisor::new(VecSink::new());
+        let cwd = std::env::temp_dir();
+        assert_eq!(
+            sup.pick_agent_for_tool("opencode", None, "", &cwd).await,
+            "opencode-server"
+        );
+        assert_eq!(
+            sup.pick_agent_for_tool("opencode", Some("opencode"), "", &cwd)
+                .await,
+            "opencode"
+        );
+    }
+
+    #[tokio::test]
+    async fn opencode_sessions_share_one_global_event_hub() {
+        let sup = Supervisor::new(VecSink::new());
+        let client = OpenCodeClient::new("http://127.0.0.1:9").unwrap();
+
+        let _first = sup.subscribe_opencode_events(&client).await;
+        let _second = sup.subscribe_opencode_events(&client).await;
+
+        let mut hubs = sup.opencode_event_hubs.lock().await;
+        assert_eq!(hubs.len(), 1);
+        for (_, hub) in hubs.drain() {
+            hub.task.abort();
         }
     }
 
@@ -3418,6 +3956,9 @@ mod tests {
             args: vec![],
             description: "test fixture".into(),
             env_allowlist: None,
+            kind: AgentKind::AcpStdio,
+            opencode_url: None,
+            opencode_auth: None,
         };
         let socket_path = tmp.path().join("budget.sock");
         let dummy_config = SpawnConfig {
@@ -3514,6 +4055,9 @@ mod tests {
             args: vec![],
             description: "test fixture".into(),
             env_allowlist: None,
+            kind: AgentKind::AcpStdio,
+            opencode_url: None,
+            opencode_auth: None,
         };
         let dummy_config = SpawnConfig {
             agent_key: "claude".into(),
@@ -3592,6 +4136,9 @@ mod tests {
             args: vec![],
             description: "test fixture".into(),
             env_allowlist: None,
+            kind: AgentKind::AcpStdio,
+            opencode_url: None,
+            opencode_auth: None,
         };
         let dummy_config = SpawnConfig {
             agent_key: "claude".into(),
@@ -3670,6 +4217,9 @@ mod tests {
             args: vec![],
             description: "test fixture".into(),
             env_allowlist: None,
+            kind: AgentKind::AcpStdio,
+            opencode_url: None,
+            opencode_auth: None,
         };
         let dummy_config = SpawnConfig {
             agent_key: "claude".into(),
@@ -3801,6 +4351,9 @@ mod tests {
             args: vec![],
             description: "test fixture".into(),
             env_allowlist: None,
+            kind: AgentKind::AcpStdio,
+            opencode_url: None,
+            opencode_auth: None,
         };
         let dummy_config = SpawnConfig {
             agent_key: "claude".into(),

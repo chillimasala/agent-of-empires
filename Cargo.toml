@@ -90,6 +90,11 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # HTTP client (for updates)
 reqwest = { version = "0.13", features = ["json", "rustls", "stream"], default-features = false }
+# Used by the opencode-serve transport (src/opencode/). Both are
+# already in the transitive dep graph via reqwest; pinning them
+# here keeps the call sites stable.
+url = "2"
+bytes = "1"
 
 # Percent-encode path segments (release tags) for GitHub API URLs.
 percent-encoding = "2"

@@ -27,6 +27,7 @@ pub mod fs_handler;
 pub mod install_hints;
 pub mod mcp_config;
 pub mod node;
+pub mod opencode_bridge;
 /// Recall cache of per-agent ACP config options; consumed only by the web
 /// dashboard defaults page, so it is compiled with the serve feature.
 #[cfg(feature = "serve")]
@@ -42,6 +43,6 @@ pub mod supervisor;
 pub mod terminal_handler;
 pub mod worker_registry;
 
-pub use agent_registry::{AgentRegistry, AgentSpec};
+pub use agent_registry::{AgentKind, AgentRegistry, AgentSpec, HttpAuth};
 pub use approvals::{Approval, ApprovalDecision, Nonce};
 pub use state::{AcpState, Event};
